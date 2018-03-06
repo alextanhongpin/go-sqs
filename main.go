@@ -17,6 +17,11 @@ import (
 	"github.com/aws/aws-sdk-go/service/sqs"
 )
 
+// 6625//3777
+// 4827 - 4302
+// 3579 / 4302
+// 2129 / 4302
+
 func Per(eventCount int, duration time.Duration) rate.Limit {
 	return rate.Every(duration / time.Duration(eventCount))
 }
@@ -37,7 +42,7 @@ func main() {
 
 	// Initialize global http client to reuse connection
 	transport := &http.Transport{
-		MaxIdleConnsPerHost: 10240,
+		MaxIdleConnsPerHost: 20,
 		TLSHandshakeTimeout: 0 * time.Second,
 	}
 	client = &http.Client{Transport: transport}
@@ -65,7 +70,7 @@ func main() {
 
 	start := time.Now()
 	// Set 1000/s
-	// limiter := rate.NewLimiter(Per(10000, time.Second), 1)
+	limiter := rate.NewLimiter(Per(100, time.Second), 1)
 
 	for {
 		params := &sqs.ReceiveMessageInput{
@@ -84,30 +89,31 @@ func main() {
 			return
 		}
 		if len(resp.Messages) > 0 {
-
-			mu.Lock()
-			counter += int64(len(resp.Messages))
-			mu.Unlock()
-
+			if err := limiter.Wait(ctx); err != nil {
+				log.Println("limiter err:", err)
+			}
 			go func() {
-				// if err := limiter.Wait(ctx); err != nil {
-				// 	log.Println("limiter err:", err)
-				// }
+
 				buf <- struct{}{}
 				doWork(svc, resp.Messages, buf)
 				// <-buf
+				mu.Lock()
+				counter += int64(len(resp.Messages))
+				mu.Unlock()
 			}()
 
 		}
 
 		select {
 		case <-ctx.Done():
-			log.Println("done:", time.Since(start), counter)
+			time.Sleep(30 * time.Second)
+			now := time.Now()
+			log.Println("cooldown period")
+			log.Println("done:", time.Since(now-start), counter)
 			return
 		default:
 		}
 	}
-
 }
 
 func doWork(svc *sqs.SQS, messages []*sqs.Message, buf chan interface{}) bool {
@@ -138,8 +144,6 @@ func handleMessage(svc *sqs.SQS, m *sqs.Message) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	// resp.Status
 
 	body, err := ioutil.ReadAll(resp.Body)
 	// _ = body
@@ -148,6 +152,7 @@ func handleMessage(svc *sqs.SQS, m *sqs.Message) error {
 		return err
 	}
 	log.Println(string(body))
+	resp.Body.Close()
 
 	// Delete message
 	params := &sqs.DeleteMessageInput{
@@ -158,6 +163,6 @@ func handleMessage(svc *sqs.SQS, m *sqs.Message) error {
 	if err != nil {
 		return err
 	}
-	// log.Println("msg del")
+	log.Println("msg del")
 	return nil
 }
