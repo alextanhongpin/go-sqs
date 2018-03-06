@@ -6,7 +6,6 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
-	"os"
 	"sync"
 	"time"
 
@@ -23,6 +22,7 @@ func Per(eventCount int, duration time.Duration) rate.Limit {
 }
 
 var (
+	client                  *http.Client
 	MaxNumberOfMessages     int64 = 10
 	WaitTimeSeconds         int64 = 0
 	VisibilityTimeoutSecond int64 = 30
@@ -35,18 +35,21 @@ var (
 
 func main() {
 
-	QueueURL = os.Getenv("QUEUE_URL")
-	ContentBuilderURL = os.Getenv("CONTENT_BUILDER_URL")
-	AWSAccessKeyID = os.Getenv("AWS_ACCESS_KEY")
-	AWSSecretAccessKey = os.Getenv("AWS_SECRET_KEY")
+	// Initialize global http client to reuse connection
+	transport := &http.Transport{
+		MaxIdleConnsPerHost: 10240,
+		TLSHandshakeTimeout: 0 * time.Second,
+	}
+	client = &http.Client{Transport: transport}
 
 	var counter int64
 	var mu sync.Mutex
+
 	// 75,530 10m0.985324667s 6590
 	// 69,146 1m0.548205912s 1930
 	ctx := context.Background()
 
-	ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	sess, err := session.NewSession(&aws.Config{
@@ -58,11 +61,11 @@ func main() {
 	}
 
 	svc := sqs.New(sess)
-	buf := make(chan interface{}, 20)
+	buf := make(chan interface{}, 1000)
 
 	start := time.Now()
 	// Set 1000/s
-	limiter := rate.NewLimiter(Per(1000, time.Second), 1)
+	// limiter := rate.NewLimiter(Per(10000, time.Second), 1)
 
 	for {
 		params := &sqs.ReceiveMessageInput{
@@ -81,16 +84,18 @@ func main() {
 			return
 		}
 		if len(resp.Messages) > 0 {
+
 			mu.Lock()
 			counter += int64(len(resp.Messages))
 			mu.Unlock()
-			buf <- struct{}{}
+
 			go func() {
-				if err := limiter.Wait(ctx); err != nil {
-					log.Println("limiter err:", err)
-				}
-				doWork(svc, resp.Messages)
-				<-buf
+				// if err := limiter.Wait(ctx); err != nil {
+				// 	log.Println("limiter err:", err)
+				// }
+				buf <- struct{}{}
+				doWork(svc, resp.Messages, buf)
+				// <-buf
 			}()
 
 		}
@@ -102,23 +107,25 @@ func main() {
 		default:
 		}
 	}
+
 }
 
-func doWork(svc *sqs.SQS, messages []*sqs.Message) bool {
-	numMessages := len(messages)
-	log.Printf("Received %d messages\n", numMessages)
+func doWork(svc *sqs.SQS, messages []*sqs.Message, buf chan interface{}) bool {
+	// numMessages := len(messages)
+	// log.Printf("Received %d messages\n", numMessages)
 
-	var wg sync.WaitGroup
-	wg.Add(numMessages)
+	// var wg sync.WaitGroup
+	// wg.Add(numMessages)
 	for i := range messages {
 		go func(m *sqs.Message) {
-			defer wg.Done()
+			// defer wg.Done()
 			if err := handleMessage(svc, m); err != nil {
 				log.Println("error handling message:", err.Error())
 			}
+			<-buf
 		}(messages[i])
 	}
-	wg.Wait()
+	// wg.Wait()
 	return true
 }
 
@@ -127,7 +134,6 @@ func handleMessage(svc *sqs.SQS, m *sqs.Message) error {
 	req, err := http.NewRequest("POST", ContentBuilderURL, bytes.NewBuffer([]byte(*m.Body)))
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -136,6 +142,7 @@ func handleMessage(svc *sqs.SQS, m *sqs.Message) error {
 	// resp.Status
 
 	body, err := ioutil.ReadAll(resp.Body)
+	// _ = body
 	if err != nil {
 		log.Println("err:", err)
 		return err
@@ -151,6 +158,6 @@ func handleMessage(svc *sqs.SQS, m *sqs.Message) error {
 	if err != nil {
 		return err
 	}
-	log.Println("msg del")
+	// log.Println("msg del")
 	return nil
 }
