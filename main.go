@@ -17,11 +17,6 @@ import (
 	"github.com/aws/aws-sdk-go/service/sqs"
 )
 
-// 6625//3777
-// 4827 - 4302
-// 3579 / 4302
-// 2129 / 4302
-
 func Per(eventCount int, duration time.Duration) rate.Limit {
 	return rate.Every(duration / time.Duration(eventCount))
 }
@@ -50,11 +45,9 @@ func main() {
 	var counter int64
 	var mu sync.Mutex
 
-	// 75,530 10m0.985324667s 6590
-	// 69,146 1m0.548205912s 1930
 	ctx := context.Background()
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 
 	sess, err := session.NewSession(&aws.Config{
@@ -107,9 +100,9 @@ func main() {
 		select {
 		case <-ctx.Done():
 			time.Sleep(30 * time.Second)
-			now := time.Now()
+
 			log.Println("cooldown period")
-			log.Println("done:", time.Since(now-start), counter)
+			log.Println("done:", time.Since(start), counter)
 			return
 		default:
 		}
@@ -117,11 +110,6 @@ func main() {
 }
 
 func doWork(svc *sqs.SQS, messages []*sqs.Message, buf chan interface{}) bool {
-	// numMessages := len(messages)
-	// log.Printf("Received %d messages\n", numMessages)
-
-	// var wg sync.WaitGroup
-	// wg.Add(numMessages)
 	for i := range messages {
 		go func(m *sqs.Message) {
 			// defer wg.Done()
@@ -131,7 +119,6 @@ func doWork(svc *sqs.SQS, messages []*sqs.Message, buf chan interface{}) bool {
 			<-buf
 		}(messages[i])
 	}
-	// wg.Wait()
 	return true
 }
 
