@@ -24,19 +24,18 @@ func Per(eventCount int, duration time.Duration) rate.Limit {
 }
 
 var (
-	mu           sync.Mutex
-	counter      int64
-	errorCounter int64
-
 	client                  *http.Client
-	MaxNumberOfMessages     int64 = 10
-	WaitTimeSeconds         int64 = 0
-	VisibilityTimeoutSecond int64 = 30
+	mu                      sync.Mutex
+	start                   time.Time
+	counter                 int64
+	waitTimeSeconds         int64
+	maxNumberOfMessages     int64 = 10
+	visibilityTimeoutSecond int64 = 30
 
-	QueueURL           string
-	ContentBuilderURL  string
-	AWSAccessKeyID     string
-	AWSSecretAccessKey string
+	queueURL           string
+	contentBuilderURL  string
+	awsAccessKeyID     string
+	awsSecretAccessKey string
 )
 
 // 	13,632 - 11192 - 2440 in 2 minutes, 20 req/s, pool 5, limiter 2 per second
@@ -69,7 +68,7 @@ func main() {
 
 	sess, err := session.NewSession(&aws.Config{
 		Region:      aws.String("ap-southeast-1"),
-		Credentials: credentials.NewStaticCredentials(AWSAccessKeyID, AWSSecretAccessKey, ""),
+		Credentials: credentials.NewStaticCredentials(awsAccessKeyID, awsSecretAccessKey, ""),
 	})
 	if err != nil {
 		log.Println(err)
@@ -85,16 +84,16 @@ func main() {
 	limiter := rate.NewLimiter(Per(50, time.Second), 0)
 
 	params := &sqs.ReceiveMessageInput{
-		QueueUrl:            aws.String(QueueURL),
-		MaxNumberOfMessages: aws.Int64(MaxNumberOfMessages),
+		QueueUrl:            aws.String(queueURL),
+		MaxNumberOfMessages: aws.Int64(maxNumberOfMessages),
 		MessageAttributeNames: []*string{
 			aws.String("All"),
 		},
-		VisibilityTimeout: aws.Int64(VisibilityTimeoutSecond), // In seconds
-		WaitTimeSeconds:   aws.Int64(WaitTimeSeconds),
+		VisibilityTimeout: aws.Int64(visibilityTimeoutSecond), // In seconds
+		WaitTimeSeconds:   aws.Int64(waitTimeSeconds),
 	}
 
-	start := time.Now()
+	start = time.Now()
 
 	for {
 		resp, err := svc.ReceiveMessage(params)
@@ -145,6 +144,7 @@ func doWork(svc *sqs.SQS, msgs []*sqs.Message, pool chan interface{}, pause chan
 				mu.Lock()
 				counter += int64(1)
 				mu.Unlock()
+				log.Printf("%0.0f req/s", float64(counter)/time.Since(start).Seconds())
 			}
 			<-pool
 		}(msgs[i])
@@ -160,6 +160,7 @@ func handleMessage(svc *sqs.SQS, m *sqs.Message) error {
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("got %v", resp.StatusCode)
@@ -169,7 +170,6 @@ func handleMessage(svc *sqs.SQS, m *sqs.Message) error {
 		log.Println("err:", err)
 		return err
 	}
-	resp.Body.Close()
 
 	// Delete message
 	if _, err = svc.DeleteMessage(&sqs.DeleteMessageInput{
