@@ -38,12 +38,6 @@ var (
 	awsSecretAccessKey string
 )
 
-// 	13,632 - 11192 - 2440 in 2 minutes, 20 req/s, pool 5, limiter 2 per second
-// 11192 - 5,382 - 5810 in 2 minutes, 48.4 req/s, pool 5, limiter 5 per second
-// 5382 - 2145 - 3237 in  2 minutes, 17 req/s, pool 5, limiter 10 per second
-// 2145 - 1045 - 1100 in 2 minutes, 9 req/s, pool 10, limiter 5 per second
-// 30,992 - 28,713: 2276 in 2 minutes 18.9 req/s pool 5, limiter 50 per second
-// 28,713
 func main() {
 
 	// Logging the number of existing goroutines
@@ -63,7 +57,7 @@ func main() {
 
 	ctx := context.Background()
 
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
 	sess, err := session.NewSession(&aws.Config{
@@ -75,13 +69,13 @@ func main() {
 	}
 
 	svc := sqs.New(sess)
-	pool := make(chan interface{}, 10)
+	pool := make(chan interface{}, 5)
 	pause := make(chan interface{}, 1)
 
 	// Limit to 5 invocations per second - each invocation will fetch n amount of messages.
 	// If n number of messages is 10, you can fetch up to 50 messages in a second,
 	// and the buffer limit only 50 in-flight messages to be available
-	limiter := rate.NewLimiter(Per(50, time.Second), 0)
+	limiter := rate.NewLimiter(Per(50, time.Second), 1)
 
 	params := &sqs.ReceiveMessageInput{
 		QueueUrl:            aws.String(queueURL),
@@ -96,64 +90,68 @@ func main() {
 	start = time.Now()
 
 	for {
-		resp, err := svc.ReceiveMessage(params)
-		if err != nil {
-			log.Println(err)
-			return
+		if err := limiter.Wait(ctx); err != nil {
+			log.Println("limiter err:", err)
+			// time.Sleep(1 * time.Second)
 		}
-
 		select {
+		case _, ok := <-pause:
+			if ok {
+				log.Println("#pausing for 10 seconds")
+				time.Sleep(5 * time.Second)
+				log.Println("#resume")
+			}
 		case <-ctx.Done():
 			log.Println("#done, pending for remaining task to complete")
 			time.Sleep(1 * time.Minute)
 			log.Println("#end:", time.Since(start), counter)
 			return
 		default:
-			if len(resp.Messages) > 0 {
-				if err := limiter.Wait(ctx); err != nil {
-					log.Println("limiter err:", err)
-					time.Sleep(1 * time.Second)
-				}
-				select {
-				case <-pause:
-					log.Println("#pausing for 10 seconds")
-					time.Sleep(10 * time.Second)
-					log.Println("#resume")
-					go doWork(svc, resp.Messages, pool, pause)
-				default:
-					go doWork(svc, resp.Messages, pool, pause)
-				}
-
-			} else {
-				log.Println("#nomsg, waiting 1 minute")
-				time.Sleep(1 * time.Minute)
-				log.Println("#end:", time.Since(start), counter)
-			}
 		}
+		// default:
+		log.Println("default")
+		resp, err := svc.ReceiveMessage(params)
+		if err != nil {
+			log.Println(err)
+			return
+		}
+		if len(resp.Messages) > 0 {
+			log.Println("got messages", len(resp.Messages))
+			pool <- struct{}{}
+			go doWork(svc, resp.Messages, pool, pause)
+		} else {
+			log.Println("#nomsg, waiting 1 minute")
+			time.Sleep(1 * time.Minute)
+			log.Println("#end:", time.Since(start), counter)
+		}
+		// }
 	}
 }
 
 func doWork(svc *sqs.SQS, msgs []*sqs.Message, pool chan interface{}, pause chan interface{}) {
+	var wg sync.WaitGroup
+	wg.Add(len(msgs))
+
 	for i := range msgs {
-		pool <- struct{}{}
 		go func(m *sqs.Message) {
-			if err := handleMessage(svc, m); err != nil {
+			if err := handleMessage(svc, m, pause); err != nil {
 				log.Println("error handling message:", err.Error())
-				pause <- struct{}{}
 			} else {
 				mu.Lock()
 				counter += int64(1)
 				mu.Unlock()
-				log.Printf("%0.0f req/s", float64(counter)/time.Since(start).Seconds())
+				log.Printf("%0.0f req/s, count = %d, elapsed = %v", float64(counter)/time.Since(start).Seconds(), counter, time.Since(start))
 			}
-			<-pool
+			wg.Done()
 		}(msgs[i])
 	}
+	wg.Wait()
+	<-pool
 }
 
-func handleMessage(svc *sqs.SQS, m *sqs.Message) error {
+func handleMessage(svc *sqs.SQS, m *sqs.Message, pause chan interface{}) error {
 	// POST
-	req, err := http.NewRequest("POST", ContentBuilderURL, bytes.NewBuffer([]byte(*m.Body)))
+	req, err := http.NewRequest("POST", contentBuilderURL, bytes.NewBuffer([]byte(*m.Body)))
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(req)
@@ -162,22 +160,29 @@ func handleMessage(svc *sqs.SQS, m *sqs.Message) error {
 	}
 	defer resp.Body.Close()
 
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Println("err:", err)
+		return err
+	}
+	log.Println("ok", string(body))
+	if resp.StatusCode >= 500 {
+		pause <- struct{}{}
+		return fmt.Errorf("got %v", resp.StatusCode)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("got %v", resp.StatusCode)
 	}
 
-	if _, err = ioutil.ReadAll(resp.Body); err != nil {
-		log.Println("err:", err)
-		return err
-	}
-
 	// Delete message
-	if _, err = svc.DeleteMessage(&sqs.DeleteMessageInput{
-		QueueUrl:      aws.String(QueueURL),
+	_, err = svc.DeleteMessage(&sqs.DeleteMessageInput{
+		QueueUrl:      aws.String(queueURL),
 		ReceiptHandle: m.ReceiptHandle,
-	}); err != nil {
+	})
+
+	if err != nil {
 		return err
 	}
-
+	log.Println("del")
 	return nil
 }
